@@ -182,6 +182,29 @@ INVALID_GEMINI_SQL = [
     "SELECT load_extension('extension.dll') FROM top_customers",
 ]
 
+SQLITE_PROMPT_EXAMPLES = [
+    (
+        "SELECT COALESCE(SUM(total_sales), 0) AS total_sales "
+        "FROM monthly_sales_by_country "
+        "WHERE month = '2025-03' AND country = 'España'",
+        [{"total_sales": 15.0}],
+    ),
+    (
+        "SELECT COALESCE(SUM(order_count), 0) AS order_count "
+        "FROM monthly_sales_by_country WHERE month = '2026-11'",
+        [{"order_count": 0}],
+    ),
+    (
+        "SELECT customer, total_spent FROM top_customers "
+        "ORDER BY total_spent DESC LIMIT 3",
+        [
+            {"customer": "Buyer E", "total_spent": 40.0},
+            {"customer": "Buyer C", "total_spent": 30.0},
+            {"customer": "Buyer B", "total_spent": 25.0},
+        ],
+    ),
+]
+
 LIVE_GEMINI_ENABLED = (
     os.getenv("RUN_GEMINI_INTEGRATION") == "1"
     and bool(os.getenv("GEMINI_API_KEY"))
@@ -217,7 +240,8 @@ def _install_gemini_stub(monkeypatch, question_to_sql):
 
         def generate_content(self, **kwargs):
             requests.append(kwargs)
-            sql = question_to_sql[kwargs["contents"]]
+            payload = json.loads(kwargs["contents"])
+            sql = question_to_sql[payload["question"]]
             return SimpleNamespace(text=json.dumps({"sql": sql}))
 
     monkeypatch.setattr(api.genai, "Client", FakeGeminiClient)
@@ -267,8 +291,45 @@ def test_gemini_question_to_sql_to_database_returns_expected_rows(
     assert response.json()["answer"] == "Respuesta simulada."
     assert response.json()["rows"] == expected_rows
     assert response.json()["truncated"] is False
-    assert gemini_requests[0]["contents"] == question
+    assert json.loads(gemini_requests[0]["contents"])["question"] == question
     assert gemini_requests[0]["config"].response_mime_type == "application/json"
+
+
+@pytest.mark.parametrize(
+    ("sql", "expected_rows"),
+    SQLITE_PROMPT_EXAMPLES,
+    ids=["monthly-sales", "empty-current-month", "top-customers"],
+)
+def test_sqlite_prompt_examples_are_valid_and_execute(
+    tmp_path, sql, expected_rows
+):
+    db_path = _create_database(tmp_path)
+
+    safe_sql = api.validate_read_query(sql)
+    _, rows, truncated = api.execute_read_query(db_path, safe_sql)
+
+    assert rows == expected_rows
+    assert truncated is False
+
+
+def test_read_only_endpoint_allows_sqlite_like_year_filter(tmp_path):
+    db_path = _create_database(tmp_path)
+    sql = (
+        "SELECT country FROM monthly_sales_by_country "
+        "WHERE month LIKE '2025-%' "
+        "GROUP BY country ORDER BY SUM(total_sales) DESC LIMIT 1"
+    )
+    app = api.create_app(
+        db_path,
+        lambda _: sql,
+        lambda question, columns, rows: "Chile tuvo las mayores ventas.",
+    )
+
+    response = _post_question(app, "¿Qué país vendió más en 2025?")
+
+    assert response.status_code == 200
+    assert response.json()["rows"] == [{"country": "Chile"}]
+    assert response.json()["answer"] == "Chile tuvo las mayores ventas."
 
 
 @pytest.mark.parametrize("generated_sql", INVALID_GEMINI_SQL)
@@ -293,15 +354,17 @@ def test_gemini_invalid_or_unsafe_sql_never_changes_database(
 
 
 @pytest.mark.parametrize(
-    ("question", "expected_rows"),
+    ("question", "expected_value", "expected_answer_value"),
     [
         (
             "¿Cuánto vendimos en España en marzo de 2025?",
-            [{"total_sales": 15.0}],
+            15.0,
+            "15",
         ),
         (
             "¿Cuántos pedidos de venta hubo en España en marzo de 2025?",
-            [{"order_count": 2}],
+            2,
+            "2",
         ),
     ],
     ids=["monthly-sales-value", "monthly-order-count"],
@@ -311,7 +374,7 @@ def test_gemini_invalid_or_unsafe_sql_never_changes_database(
     reason="Activa RUN_GEMINI_INTEGRATION=1 para llamar al servicio Gemini.",
 )
 def test_live_gemini_returns_correct_answer_from_sqlite(
-    tmp_path, question, expected_rows
+    tmp_path, question, expected_value, expected_answer_value
 ):
     db_path = _create_database(tmp_path)
     app = api.create_app(db_path)
@@ -319,7 +382,16 @@ def test_live_gemini_returns_correct_answer_from_sqlite(
     response = _post_question(app, question)
 
     assert response.status_code == 200, response.json()
-    assert response.json()["rows"] == expected_rows
+    answer = response.json()["answer"].lower()
+    assert answer.strip()
+    assert expected_answer_value in answer
+    numeric_values = [
+        value
+        for row in response.json()["rows"]
+        for value in row.values()
+        if isinstance(value, (int, float))
+    ]
+    assert any(value == pytest.approx(expected_value) for value in numeric_values)
     assert response.json()["truncated"] is False
 
 
@@ -337,6 +409,12 @@ def test_live_gemini_finds_the_top_spending_customers(tmp_path):
     )
 
     assert response.status_code == 200, response.json()
+    answer = response.json()["answer"].lower()
+    assert answer.strip()
+    assert all(
+        customer.lower() in answer
+        for customer in ("Buyer E", "Buyer C", "Buyer B")
+    )
     assert response.json()["rows"] == [
         {"customer": "Buyer E", "total_spent": 40.0},
         {"customer": "Buyer C", "total_spent": 30.0},

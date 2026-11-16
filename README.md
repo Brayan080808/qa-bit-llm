@@ -72,6 +72,12 @@ limita la respuesta a 500 filas. Configura `GEMINI_MODEL` para elegir otro model
 `.env` está excluido de Git; las pruebas simulan Gemini y no requieren una clave
 real. Si Gemini no puede redactar la respuesta, la API devuelve un error claro.
 
+Las instrucciones de los dos pasos del modelo están en
+`prompts/sql_generation.txt` y `prompts/answer_generation.txt`, no embebidas en
+Python. Cada petición a Gemini recibe también la fecha y hora local actual en
+ISO 8601 con zona horaria; el prompt SQL la usa para resolver expresiones como
+"este mes" y generar sintaxis SQLite.
+
 El SQL generado y el SQL validado (junto con la ruta de SQLite) aparecen en los
 logs de Uvicorn. Si la API indica que faltan las vistas analíticas, detén el
 servidor y ejecuta `python clean_orders.py`; esto recrea las vistas, pero también

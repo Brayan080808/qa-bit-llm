@@ -2,6 +2,7 @@ import csv
 import json
 import logging
 import sqlite3
+from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -124,6 +125,21 @@ def test_validate_read_query_rejects_non_string_input():
         api.validate_read_query(None)
 
 
+def test_prompt_loader_reports_missing_file(monkeypatch, tmp_path):
+    monkeypatch.setattr(api, "PROMPTS_DIR", tmp_path)
+
+    with pytest.raises(RuntimeError, match="No se pudo cargar el prompt"):
+        api._read_prompt("missing.txt")
+
+
+def test_prompt_loader_rejects_empty_file(monkeypatch, tmp_path):
+    monkeypatch.setattr(api, "PROMPTS_DIR", tmp_path)
+    (tmp_path / "empty.txt").write_text("", encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match="archivo de prompt está vacío"):
+        api._read_prompt("empty.txt")
+
+
 def test_cleaning_load_creates_monthly_sales_view_with_paid_orders_only(tmp_path):
     orders = [
         _order(amount="10.00"),
@@ -203,6 +219,21 @@ def test_endpoint_calls_injected_llm_and_returns_query_results(tmp_path):
     ]
     assert response.json()["rows"] == [{"country": "España", "total_sales": 12.34}]
     assert response.json()["truncated"] is False
+
+
+def test_endpoint_executes_sqlite_coalesce_for_month_without_orders(tmp_path):
+    sqlite_sql = (
+        "SELECT COALESCE(SUM(order_count), 0) AS order_count "
+        "FROM monthly_sales_by_country WHERE month = '2026-11'"
+    )
+    client, _ = _client_for_orders(
+        tmp_path, [_order(order_date="2025-03-01")], lambda _: sqlite_sql
+    )
+
+    response = _post(client, "¿Cuántas ventas hubo este mes?")
+
+    assert response.status_code == 200
+    assert response.json()["rows"] == [{"order_count": 0}]
 
 
 def test_endpoint_returns_clear_error_when_answer_generation_fails(tmp_path):
@@ -400,8 +431,15 @@ def test_gemini_generator_returns_sql_from_json_response(monkeypatch):
     assert clients[0].api_key == "test-key"
     assert clients[0].closed is True
     assert request_options["model"] == "test-model"
-    assert request_options["contents"] == "clientes principales"
+    sql_context = json.loads(request_options["contents"])
+    assert sql_context["question"] == "clientes principales"
+    assert (
+        datetime.fromisoformat(sql_context["current_datetime"]).utcoffset()
+        is not None
+    )
     assert request_options["config"].response_mime_type == "application/json"
+    assert request_options["config"].system_instruction == api.SQL_GENERATION_PROMPT
+    assert "SQLite" in request_options["config"].system_instruction
 
 
 def test_gemini_generator_requires_api_key(monkeypatch):
@@ -486,11 +524,15 @@ def test_gemini_answer_generator_uses_question_and_sqlite_rows(monkeypatch):
     assert clients[0].api_key == "test-key"
     assert clients[0].closed is True
     assert request_options["model"] == "test-model"
-    assert json.loads(request_options["contents"]) == {
-        "question": "¿Cuánto vendimos?",
-        "columns": ["country", "total_sales"],
-        "rows": [{"country": "España", "total_sales": 12.34}],
-    }
+    answer_context = json.loads(request_options["contents"])
+    assert answer_context["question"] == "¿Cuánto vendimos?"
+    assert (
+        datetime.fromisoformat(answer_context["current_datetime"]).utcoffset()
+        is not None
+    )
+    assert answer_context["columns"] == ["country", "total_sales"]
+    assert answer_context["rows"] == [{"country": "España", "total_sales": 12.34}]
+    assert request_options["config"].system_instruction == api.ANSWER_GENERATION_PROMPT
 
 
 def test_gemini_answer_generator_requires_api_key(monkeypatch):

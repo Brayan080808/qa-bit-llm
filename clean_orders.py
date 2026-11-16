@@ -105,6 +105,33 @@ def load_orders(csv_path: Path = DEFAULT_CSV_PATH, db_path: Path = DEFAULT_DB_PA
                 """,
                 rows,
             )
+            connection.execute(
+                """
+                CREATE VIEW IF NOT EXISTS monthly_sales_by_country AS
+                SELECT
+                    substr(order_date, 1, 7) AS month,
+                    country,
+                    SUM(amount_cents) / 100.0 AS total_sales,
+                    COUNT(*) AS order_count
+                FROM orders
+                WHERE status IN ('paid', 'shipped')
+                GROUP BY substr(order_date, 1, 7), country
+                """
+            )
+            connection.execute(
+                """
+                CREATE VIEW IF NOT EXISTS top_customers AS
+                SELECT
+                    customer,
+                    COUNT(*) AS order_count,
+                    SUM(amount_cents) / 100.0 AS total_spent
+                FROM orders
+                WHERE status IN ('paid', 'shipped')
+                GROUP BY customer
+                ORDER BY total_spent DESC, customer ASC
+                LIMIT 10
+                """
+            )
     finally:
         connection.close()
 

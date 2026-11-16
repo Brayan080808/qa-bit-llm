@@ -1,5 +1,34 @@
 # qa-bit-llm
 
+## Instalacion resumen
+- python generate_orders.py
+- python clean_orders.py --csv data/orders.csv --db data/orders.sqlite
+- python -m pip install -r requirements.txt -r requirements-dev.txt
+- colocar tu api key en el .env (GEMINI_API_KEY)
+- python setup_project.py
+uvicorn api:app --reload
+
+## Test resumen
+- python -m pytest
+- python -m pytest --cov=api --cov=clean_orders --cov=generate_orders --cov-branch --cov-report=term-missing
+- $env:RUN_GEMINI_INTEGRATION = "1"
+python -m pytest tests/test_gemini_database.py -k live_gemini
+Remove-Item Env:RUN_GEMINI_INTEGRATION (Nota puede llegar a fallar por los limites de la api)
+
+## Decisiones y siguientes pasos
+
+- Se eligió SQLite para no requerir un servicio externo. El CSV usa fechas ISO;
+  se eliminan duplicados exactos y se descartan filas con fechas inválidas o
+  importes vacíos/no válidos. Los importes se persisten en centavos enteros.
+- Las vistas consideran ventas solo los pedidos `paid` o `shipped`; los 10
+  clientes se ordenan por gasto total, con desempate por nombre.
+- Con más tiempo agregaría migraciones, autenticación y límites de uso para la
+  API, observabilidad de errores del LLM y pruebas de carga.
+- Se implementarian semaforos para limitar las consultar al mismo tiempo y evitar saturar el sistema 
+- Impleria cache con Redis para las preguntas mas frecuentes
+- Anadira mas documentacion para mayor contexto respecto a logica de negocio
+
+
 ## Datos de pedidos y SQLite
 
 El proyecto genera un CSV determinista con 1.000 pedidos válidos y 30 filas
@@ -146,15 +175,6 @@ logs de Uvicorn. Si la API indica que faltan las vistas analíticas, detén el
 servidor y ejecuta `python clean_orders.py`; esto recrea las vistas, pero también
 recarga la tabla `orders` desde `data/orders.csv`. Luego vuelve a iniciar Uvicorn.
 
-## Decisiones y siguientes pasos
-
-- Se eligió SQLite para no requerir un servicio externo. El CSV usa fechas ISO;
-  se eliminan duplicados exactos y se descartan filas con fechas inválidas o
-  importes vacíos/no válidos. Los importes se persisten en centavos enteros.
-- Las vistas consideran ventas solo los pedidos `paid` o `shipped`; los 10
-  clientes se ordenan por gasto total, con desempate por nombre.
-- Con más tiempo agregaría migraciones, autenticación y límites de uso para la
-  API, observabilidad de errores del LLM y pruebas de carga.
 
 ## Uso de IA
 

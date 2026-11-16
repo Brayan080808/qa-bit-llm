@@ -175,14 +175,47 @@ DATABASE_CASES = [
 ]
 
 INVALID_GEMINI_SQL = [
-    "SELECT * FROM orders",
     "DELETE FROM orders",
     "SELECT * FROM monthly_sales_by_country; DROP TABLE orders",
     "SELECT 1",
     "SELECT load_extension('extension.dll') FROM top_customers",
+    'SELECT * FROM "Usuarios administradores"',
 ]
 
 SQLITE_PROMPT_EXAMPLES = [
+    (
+        "SELECT * FROM orders WHERE country = 'Chile' "
+        "ORDER BY amount_cents DESC LIMIT 20",
+        [
+            {
+                "order_id": 11,
+                "order_date": "2025-04-01",
+                "customer": "Buyer E",
+                "country": "Chile",
+                "product": "Laptop",
+                "amount_cents": 50000,
+                "status": "pending",
+            },
+            {
+                "order_id": 10,
+                "order_date": "2025-02-14",
+                "customer": "Buyer E",
+                "country": "Chile",
+                "product": "Laptop",
+                "amount_cents": 4000,
+                "status": "paid",
+            },
+        ],
+    ),
+    (
+        "SELECT customer AS name, amount_cents / 100.0 AS price "
+        "FROM orders WHERE country = 'Chile' "
+        "ORDER BY amount_cents DESC LIMIT 20",
+        [
+            {"name": "Buyer E", "price": 500.0},
+            {"name": "Buyer E", "price": 40.0},
+        ],
+    ),
     (
         "SELECT COALESCE(SUM(total_sales), 0) AS total_sales "
         "FROM monthly_sales_by_country "
@@ -242,7 +275,11 @@ def _install_gemini_stub(monkeypatch, question_to_sql):
             requests.append(kwargs)
             payload = json.loads(kwargs["contents"])
             sql = question_to_sql[payload["question"]]
-            return SimpleNamespace(text=json.dumps({"sql": sql}))
+            return SimpleNamespace(
+                text=json.dumps(
+                    {"responseType": "sql", "modelResponse": sql}
+                )
+            )
 
     monkeypatch.setattr(api.genai, "Client", FakeGeminiClient)
     return requests
@@ -293,12 +330,19 @@ def test_gemini_question_to_sql_to_database_returns_expected_rows(
     assert response.json()["truncated"] is False
     assert json.loads(gemini_requests[0]["contents"])["question"] == question
     assert gemini_requests[0]["config"].response_mime_type == "application/json"
+    assert gemini_requests[0]["config"].response_schema is api.RespuestaJSON
 
 
 @pytest.mark.parametrize(
     ("sql", "expected_rows"),
     SQLITE_PROMPT_EXAMPLES,
-    ids=["monthly-sales", "empty-current-month", "top-customers"],
+    ids=[
+        "chile-orders",
+        "chile-customer-prices",
+        "monthly-sales",
+        "empty-current-month",
+        "top-customers",
+    ],
 )
 def test_sqlite_prompt_examples_are_valid_and_execute(
     tmp_path, sql, expected_rows
@@ -333,7 +377,7 @@ def test_read_only_endpoint_allows_sqlite_like_year_filter(tmp_path):
 
 
 @pytest.mark.parametrize("generated_sql", INVALID_GEMINI_SQL)
-def test_gemini_invalid_or_unsafe_sql_never_changes_database(
+def test_gemini_invalid_or_unsafe_sql_gets_explained_without_execution(
     tmp_path, monkeypatch, generated_sql
 ):
     db_path = _create_database(tmp_path)
@@ -342,11 +386,18 @@ def test_gemini_invalid_or_unsafe_sql_never_changes_database(
     app = api.create_app(
         db_path,
         answer_generator=lambda question, columns, rows: "Respuesta simulada.",
+        unavailable_answer_generator=lambda question, limitation, history: (
+            "Solo puedo consultar los análisis de pedidos permitidos."
+        ),
     )
 
     response = _post_question(app, question)
 
-    assert response.status_code == 502
+    assert response.status_code == 200
+    assert response.json()["answer"] == (
+        "Solo puedo consultar los análisis de pedidos permitidos."
+    )
+    assert response.json()["sql"] is None
     with sqlite3.connect(db_path) as connection:
         assert connection.execute("SELECT COUNT(*) FROM orders").fetchone()[0] == len(
             ORDERS

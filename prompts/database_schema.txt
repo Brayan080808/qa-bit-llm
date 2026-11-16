@@ -1,0 +1,73 @@
+## Database schema
+
+The following objects are available in the SQLite database. Only query objects
+explicitly marked as allowed. Object and column names are case-sensitive in
+this documentation, but use the exact identifiers shown in SQL.
+
+### Allowed table: orders
+
+```sql
+CREATE TABLE orders (
+    order_id INTEGER PRIMARY KEY,
+    order_date TEXT NOT NULL,
+    customer TEXT NOT NULL,
+    country TEXT NOT NULL,
+    product TEXT NOT NULL,
+    amount_cents INTEGER NOT NULL,
+    status TEXT NOT NULL
+);
+```
+
+`order_date` uses ISO `YYYY-MM-DD` text. `amount_cents` is an integer number of
+cents; for a human-readable price, select `amount_cents / 100.0 AS price`.
+Typical `status` values include `paid`, `shipped`, `pending`, and `cancelled`.
+For completed-sales questions, include only `paid` and `shipped` rows unless the
+user explicitly asks about another status.
+
+### Allowed view: monthly_sales_by_country
+
+```sql
+CREATE VIEW monthly_sales_by_country AS
+SELECT
+    substr(order_date, 1, 7) AS month,
+    country,
+    SUM(amount_cents) / 100.0 AS total_sales,
+    COUNT(*) AS order_count
+FROM orders
+WHERE status IN ('paid', 'shipped')
+GROUP BY substr(order_date, 1, 7), country;
+```
+
+Columns: `month` (`YYYY-MM` text), `country`, `total_sales` (currency units),
+and `order_count`. This view includes only paid and shipped orders.
+
+### Allowed view: top_customers
+
+```sql
+CREATE VIEW top_customers AS
+SELECT
+    customer,
+    COUNT(*) AS order_count,
+    SUM(amount_cents) / 100.0 AS total_spent
+FROM orders
+WHERE status IN ('paid', 'shipped')
+GROUP BY customer
+ORDER BY total_spent DESC, customer ASC
+LIMIT 10;
+```
+
+Columns: `customer`, `order_count`, and `total_spent` (currency units). This
+view includes only paid and shipped orders and contains at most ten customers.
+
+### Restricted object
+
+The database also contains a table named `Usuarios administradores` with
+columns `id`, `created_at`, and `nombre`. This table is not an allowed query
+source. Never query it, expose its contents, or infer information from it.
+
+## Query-source policy
+
+Allowed query sources are only `orders`, `monthly_sales_by_country`, and
+`top_customers`. The API independently validates each generated statement and
+executes it with a read-only SQLite authorizer. Never use any other table,
+view, attached database, or schema.

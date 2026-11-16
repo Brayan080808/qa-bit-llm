@@ -32,7 +32,11 @@ def _order(
 
 
 def _client_for_orders(
-    tmp_path, orders, query_generator, answer_generator=None
+    tmp_path,
+    orders,
+    query_generator,
+    answer_generator=None,
+    unavailable_answer_generator=None,
 ):
     csv_path = tmp_path / "input" / "orders.csv"
     csv_path.parent.mkdir(parents=True, exist_ok=True)
@@ -45,16 +49,38 @@ def _client_for_orders(
     clean_orders.load_orders(csv_path, db_path)
     if answer_generator is None:
         answer_generator = lambda question, columns, rows: "Respuesta de prueba."
-    return api.create_app(db_path, query_generator, answer_generator), db_path
+    return (
+        api.create_app(
+            db_path,
+            query_generator,
+            answer_generator,
+            unavailable_answer_generator,
+        ),
+        db_path,
+    )
 
 
-def _post(app, question):
+def _post(app, question, conversation_id=None):
     async def send_request():
         async with httpx.AsyncClient(
             transport=httpx.ASGITransport(app=app),
             base_url="http://test",
         ) as client:
-            return await client.post("/ask", json={"question": question})
+            payload = {"question": question}
+            if conversation_id is not None:
+                payload["conversation_id"] = conversation_id
+            return await client.post("/ask", json=payload)
+
+    return anyio.run(send_request)
+
+
+def _delete_conversation(app, conversation_id):
+    async def send_request():
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app),
+            base_url="http://test",
+        ) as client:
+            return await client.delete(f"/conversations/{conversation_id}")
 
     return anyio.run(send_request)
 
@@ -89,13 +115,14 @@ def _patch_gemini_client(monkeypatch, generate_content):
     [
         "SELECT month, total_sales FROM monthly_sales_by_country",
         " SELECT customer FROM top_customers ORDER BY total_spent DESC; ",
+        "SELECT * FROM orders WHERE country = 'Chile' ORDER BY amount_cents DESC",
     ],
 )
-def test_validate_read_query_accepts_selects_from_allowed_views(sql):
+def test_validate_read_query_accepts_selects_from_allowed_sources(sql):
     normalized = api.validate_read_query(sql)
 
     assert "SELECT" in normalized.upper()
-    assert any(view in normalized for view in api.ALLOWED_VIEWS)
+    assert any(source in normalized for source in api.ALLOWED_QUERY_SOURCES)
 
 
 @pytest.mark.parametrize(
@@ -105,7 +132,7 @@ def test_validate_read_query_accepts_selects_from_allowed_views(sql):
         "INSERT INTO orders VALUES (1)",
         "DELETE FROM orders",
         "DROP TABLE orders",
-        "SELECT * FROM orders",
+        'SELECT * FROM "Usuarios administradores"',
         "SELECT * FROM sqlite_master",
         "SELECT * FROM main.monthly_sales_by_country",
         "SELECT 1",
@@ -221,6 +248,125 @@ def test_endpoint_calls_injected_llm_and_returns_query_results(tmp_path):
     assert response.json()["truncated"] is False
 
 
+def test_endpoint_reuses_context_for_follow_up_questions(tmp_path, monkeypatch):
+    query_histories = []
+    answer_histories = []
+
+    def fake_sql(question, history):
+        query_histories.append(history)
+        return "SELECT country, total_sales FROM monthly_sales_by_country"
+
+    def fake_answer(question, columns, rows, history):
+        answer_histories.append(history)
+        return f"Respuesta {len(answer_histories)}."
+
+    monkeypatch.setattr(api, "generate_sql_with_gemini", fake_sql)
+    monkeypatch.setattr(api, "generate_answer_with_gemini", fake_answer)
+    _, db_path = _client_for_orders(tmp_path, [_order()], None)
+    app = api.create_app(db_path)
+
+    first_response = _post(app, "Ventas en España")
+    conversation_id = first_response.json()["conversation_id"]
+    second_response = _post(app, "¿Y en marzo?", conversation_id)
+
+    assert first_response.status_code == 200
+    assert second_response.status_code == 200
+    assert second_response.json()["conversation_id"] == conversation_id
+    expected_history = [
+        {
+            "question": "Ventas en España",
+            "sql": first_response.json()["sql"],
+            "answer": first_response.json()["answer"],
+        }
+    ]
+    assert query_histories == [[], expected_history]
+    assert answer_histories == [[], expected_history]
+
+
+def test_delete_conversation_clears_its_context(tmp_path, monkeypatch):
+    received_histories = []
+
+    def fake_sql(question, history):
+        received_histories.append(history)
+        return "SELECT country FROM monthly_sales_by_country"
+
+    monkeypatch.setattr(api, "generate_sql_with_gemini", fake_sql)
+    monkeypatch.setattr(
+        api,
+        "generate_answer_with_gemini",
+        lambda question, columns, rows, history: "Respuesta de prueba.",
+    )
+    _, db_path = _client_for_orders(tmp_path, [_order()], None)
+    app = api.create_app(db_path)
+
+    first_response = _post(app, "Ventas en España")
+    conversation_id = first_response.json()["conversation_id"]
+    delete_response = _delete_conversation(app, conversation_id)
+    next_response = _post(app, "¿Y en marzo?", conversation_id)
+
+    assert delete_response.status_code == 200
+    assert delete_response.json() == {
+        "conversation_id": conversation_id,
+        "cleared": True,
+    }
+    assert next_response.status_code == 200
+    assert received_histories == [[], []]
+
+
+def test_delete_conversation_returns_404_for_unknown_context(tmp_path):
+    _, db_path = _client_for_orders(tmp_path, [_order()], None)
+    app = api.create_app(db_path)
+
+    response = _delete_conversation(
+        app, "a5bcbb64-8d90-4ab6-8ca1-c7b48a3ef118"
+    )
+
+    assert response.status_code == 404
+
+
+def test_conversation_cache_expires_after_idle_timeout(monkeypatch):
+    now = [100.0]
+    monkeypatch.setattr(api.time, "monotonic", lambda: now[0])
+    cache = api.ConversationCache()
+    cache.add_turn(
+        "conversation",
+        {"question": "ventas", "sql": "SELECT 1", "answer": "Respuesta."},
+    )
+
+    now[0] += api.CONVERSATION_TTL_SECONDS
+
+    assert cache.get_history("conversation") == []
+
+
+def test_conversation_cache_keeps_only_the_most_recent_turns():
+    cache = api.ConversationCache()
+    for index in range(api.MAX_CONVERSATION_TURNS + 2):
+        cache.add_turn(
+            "conversation",
+            {"question": str(index), "sql": "SELECT 1", "answer": "Respuesta."},
+        )
+
+    history = cache.get_history("conversation")
+
+    assert len(history) == api.MAX_CONVERSATION_TURNS
+    assert history[0]["question"] == "2"
+    assert history[-1]["question"] == str(api.MAX_CONVERSATION_TURNS + 1)
+
+
+def test_conversation_cache_evicts_least_recently_used_session(monkeypatch):
+    monkeypatch.setattr(api, "MAX_CONVERSATIONS", 2)
+    cache = api.ConversationCache()
+    turn = {"question": "ventas", "sql": "SELECT 1", "answer": "Respuesta."}
+    cache.add_turn("first", turn)
+    cache.add_turn("second", turn)
+    cache.get_history("first")
+    cache.add_turn("third", turn)
+
+    assert cache.get_history("second") == []
+    assert cache.get_history("first") == [turn]
+    assert cache.get_history("third") == [turn]
+
+
 def test_endpoint_executes_sqlite_coalesce_for_month_without_orders(tmp_path):
     sqlite_sql = (
         "SELECT COALESCE(SUM(order_count), 0) AS order_count "
@@ -267,17 +413,75 @@ def test_endpoint_returns_clear_error_when_llm_fails(tmp_path):
     assert response.json()["detail"] == "Fallo simulado del proveedor."
 
 
-def test_endpoint_rejects_llm_generated_write_query_without_changing_database(tmp_path):
+def test_endpoint_explains_rejected_write_query_without_changing_database(tmp_path):
+    fallback_calls = []
+
+    def fallback(question, limitation, history):
+        fallback_calls.append((question, limitation, history))
+        return "No puedo borrar pedidos. Puedo ayudarte a analizar las ventas."
+
     client, db_path = _client_for_orders(
-        tmp_path, [_order()], lambda _: "DELETE FROM orders"
+        tmp_path,
+        [_order()],
+        lambda _: "DELETE FROM orders",
+        unavailable_answer_generator=fallback,
     )
 
     response = _post(client, "borra los pedidos")
 
-    assert response.status_code == 502
-    assert "no permitida" in response.json()["detail"]
+    assert response.status_code == 200
+    assert response.json()["answer"] == (
+        "No puedo borrar pedidos. Puedo ayudarte a analizar las ventas."
+    )
+    assert response.json()["sql"] is None
+    assert fallback_calls[0][0] == "borra los pedidos"
+    assert "consulta segura" in fallback_calls[0][1]
     with sqlite3.connect(db_path) as connection:
         assert connection.execute("SELECT COUNT(*) FROM orders").fetchone()[0] == 1
+
+
+def test_endpoint_asks_gemini_to_explain_unsafe_query(tmp_path, monkeypatch):
+    fallback_calls = []
+
+    def fallback(question, limitation, history):
+        fallback_calls.append((question, limitation, history))
+        return "No puedo acceder a ese detalle; puedo resumir ventas por país."
+
+    monkeypatch.setattr(api, "generate_unavailable_answer_with_gemini", fallback)
+    client, _ = _client_for_orders(
+        tmp_path,
+        [_order()],
+        lambda _: 'SELECT * FROM "Usuarios administradores"',
+    )
+
+    response = _post(client, "Dame cada pedido individual")
+
+    assert response.status_code == 200
+    assert response.json()["answer"].startswith("No puedo acceder")
+    assert response.json()["sql"] is None
+    assert fallback_calls[0][0] == "Dame cada pedido individual"
+    assert "consulta segura" in fallback_calls[0][1]
+
+
+def test_endpoint_reports_error_if_gemini_cannot_explain_unsafe_query(
+    tmp_path, monkeypatch
+):
+    def failing_fallback(question, limitation, history):
+        raise api.LLMQueryError("Gemini no pudo explicar la limitación.")
+
+    monkeypatch.setattr(
+        api, "generate_unavailable_answer_with_gemini", failing_fallback
+    )
+    client, _ = _client_for_orders(
+        tmp_path,
+        [_order()],
+        lambda _: 'SELECT * FROM "Usuarios administradores"',
+    )
+
+    response = _post(client, "Dame cada pedido individual")
+
+    assert response.status_code == 502
+    assert response.json()["detail"] == "Gemini no pudo explicar la limitación."
 
 
 def test_endpoint_returns_422_for_blank_question_without_calling_llm(tmp_path):
@@ -351,11 +555,55 @@ def test_endpoint_logs_validated_sql_and_database_path(tmp_path, caplog):
     )
 
 
-def test_execute_read_query_denies_direct_access_to_orders_table(tmp_path):
-    _, db_path = _client_for_orders(tmp_path, [_order()], lambda _: "")
+def test_execute_read_query_allows_direct_orders_and_sorts_by_amount(tmp_path):
+    orders = [
+        _order(customer="Cliente bajo", country="Chile", amount="10.00"),
+        _order(customer="Cliente alto", country="Chile", amount="25.50"),
+        _order(customer="Cliente MX", country="México", amount="100.00"),
+    ]
+    _, db_path = _client_for_orders(tmp_path, orders, lambda _: "")
+    sql = (
+        "SELECT customer, amount_cents FROM orders "
+        "WHERE country = 'Chile' ORDER BY amount_cents DESC"
+    )
 
-    with pytest.raises(sqlite3.DatabaseError):
-        api.execute_read_query(db_path, "SELECT * FROM orders")
+    safe_sql = api.validate_read_query(sql)
+    columns, rows, truncated = api.execute_read_query(db_path, safe_sql)
+
+    assert columns == ["customer", "amount_cents"]
+    assert rows == [
+        {"customer": "Cliente alto", "amount_cents": 2550},
+        {"customer": "Cliente bajo", "amount_cents": 1000},
+    ]
+    assert truncated is False
+
+
+def test_endpoint_returns_order_details_in_a_readable_table(tmp_path):
+    orders = [
+        _order(customer="Cliente bajo", country="Chile", amount="10.00"),
+        _order(customer="Cliente alto", country="Chile", amount="25.50"),
+    ]
+    sql = (
+        "SELECT customer AS name, amount_cents / 100.0 AS price "
+        "FROM orders WHERE country = 'Chile' "
+        "ORDER BY amount_cents DESC LIMIT 20"
+    )
+    markdown_answer = "| Nombre | Precio |\n|---|---:|\n| Cliente alto | 25.50 |"
+    app, _ = _client_for_orders(
+        tmp_path,
+        orders,
+        lambda _: sql,
+        answer_generator=lambda question, columns, rows: markdown_answer,
+    )
+
+    response = _post(app, "Muestra nombres y precios de pedidos de Chile")
+
+    assert response.status_code == 200
+    assert response.json()["rows"] == [
+        {"name": "Cliente alto", "price": 25.5},
+        {"name": "Cliente bajo", "price": 10.0},
+    ]
+    assert response.json()["answer"] == markdown_answer
 
 
 def test_read_only_authorizer_denies_unapproved_sql_functions():
@@ -363,6 +611,18 @@ def test_read_only_authorizer_denies_unapproved_sql_functions():
         sqlite3.SQLITE_FUNCTION,
         None,
         "load_extension",
+        "main",
+        None,
+    )
+
+    assert decision == sqlite3.SQLITE_DENY
+
+
+def test_read_only_authorizer_denies_restricted_admin_table():
+    decision = api._read_only_authorizer(
+        sqlite3.SQLITE_READ,
+        "Usuarios administradores",
+        "nombre",
         "main",
         None,
     )
@@ -400,32 +660,70 @@ def test_endpoint_reports_when_result_rows_are_truncated(tmp_path):
     assert response.json()["truncated"] is True
 
 
-def test_endpoint_denies_unapproved_sql_functions(tmp_path):
+def test_endpoint_explains_sqlite_authorization_errors(tmp_path):
     client, _ = _client_for_orders(
         tmp_path,
         [_order()],
         lambda _: "SELECT load_extension('extension.dll') "
         "FROM monthly_sales_by_country",
+        unavailable_answer_generator=lambda question, limitation, history: (
+            "Solo puedo consultar los análisis de pedidos disponibles."
+        ),
     )
 
     response = _post(client, "ejecuta una extension")
 
-    assert response.status_code == 502
-    assert "no se pudo ejecutar" in response.json()["detail"]
+    assert response.status_code == 200
+    assert response.json()["answer"] == (
+        "Solo puedo consultar los análisis de pedidos disponibles."
+    )
+    assert response.json()["sql"] is None
+
+
+def test_endpoint_returns_direct_llm_response_without_query(tmp_path):
+    app = api.create_app(
+        tmp_path / "missing.sqlite",
+        lambda _: api.LLMDirectResponse(
+            "Puedo ayudarte con ventas mensuales por país o clientes principales."
+        ),
+    )
+
+    response = _post(app, "¿Qué tiempo hace hoy?")
+
+    assert response.status_code == 200
+    assert response.json()["answer"].startswith("Puedo ayudarte")
+    assert response.json()["sql"] is None
+    assert response.json()["rows"] == []
 
 
 def test_gemini_generator_returns_sql_from_json_response(monkeypatch):
     request_options = {}
+    conversation_history = [
+        {
+            "question": "Ventas en España",
+            "sql": "SELECT country FROM monthly_sales_by_country",
+            "answer": "En España hubo ventas.",
+        }
+    ]
 
     def generate_content(**kwargs):
         request_options.update(kwargs)
-        return SimpleNamespace(text=json.dumps({"sql": "SELECT * FROM top_customers"}))
+        return SimpleNamespace(
+            text=json.dumps(
+                {
+                    "responseType": "sql",
+                    "modelResponse": "SELECT * FROM top_customers",
+                }
+            )
+        )
 
     monkeypatch.setenv("GEMINI_API_KEY", "test-key")
     monkeypatch.setenv("GEMINI_MODEL", "test-model")
     clients = _patch_gemini_client(monkeypatch, generate_content)
 
-    sql = api.generate_sql_with_gemini("clientes principales")
+    sql = api.generate_sql_with_gemini(
+        "clientes principales", conversation_history
+    )
 
     assert sql == "SELECT * FROM top_customers"
     assert clients[0].api_key == "test-key"
@@ -433,13 +731,37 @@ def test_gemini_generator_returns_sql_from_json_response(monkeypatch):
     assert request_options["model"] == "test-model"
     sql_context = json.loads(request_options["contents"])
     assert sql_context["question"] == "clientes principales"
+    assert sql_context["conversation_history"] == conversation_history
     assert (
         datetime.fromisoformat(sql_context["current_datetime"]).utcoffset()
         is not None
     )
     assert request_options["config"].response_mime_type == "application/json"
+    assert request_options["config"].response_schema is api.RespuestaJSON
     assert request_options["config"].system_instruction == api.SQL_GENERATION_PROMPT
     assert "SQLite" in request_options["config"].system_instruction
+    assert "amount_cents INTEGER NOT NULL" in (
+        request_options["config"].system_instruction
+    )
+
+
+def test_gemini_generator_returns_direct_response_from_json(monkeypatch):
+    direct_answer = (
+        "Puedo ayudar con ventas por mes y país o clientes principales."
+    )
+    monkeypatch.setenv("GEMINI_API_KEY", "test-key")
+    _patch_gemini_client(
+        monkeypatch,
+        lambda **_: SimpleNamespace(
+            text=json.dumps(
+                {"responseType": "answer", "modelResponse": direct_answer}
+            )
+        ),
+    )
+
+    result = api.generate_sql_with_gemini("¿Qué tiempo hace hoy?")
+
+    assert result == api.LLMDirectResponse(direct_answer)
 
 
 def test_gemini_generator_requires_api_key(monkeypatch):
@@ -489,8 +811,20 @@ def test_gemini_generator_reports_network_errors(monkeypatch):
     ("content", "error"),
     [
         ("not json", "JSON válido"),
-        ('{"query":"SELECT 1"}', "no contiene"),
-        ("[]", "no contiene"),
+        ('{"responseType":"sql"}', "esquema JSON esperado"),
+        ("[]", "esquema JSON esperado"),
+        (
+            '{"responseType":"maybe","modelResponse":"SELECT 1"}',
+            "esquema JSON esperado",
+        ),
+        (
+            '{"responseType":"sql","modelResponse":"   "}',
+            "campo modelResponse vacío",
+        ),
+        (
+            '{"responseType":"sql","modelResponse":"SELECT 1","extra":"value"}',
+            "esquema JSON esperado",
+        ),
     ],
 )
 def test_gemini_generator_reports_malformed_responses(monkeypatch, content, error):
@@ -505,10 +839,24 @@ def test_gemini_generator_reports_malformed_responses(monkeypatch, content, erro
 
 def test_gemini_answer_generator_uses_question_and_sqlite_rows(monkeypatch):
     request_options = {}
+    conversation_history = [
+        {
+            "question": "Ventas en España",
+            "sql": "SELECT country FROM monthly_sales_by_country",
+            "answer": "En España hubo ventas.",
+        }
+    ]
 
     def generate_content(**kwargs):
         request_options.update(kwargs)
-        return SimpleNamespace(text="En España se vendieron 12.34.")
+        return SimpleNamespace(
+            text=json.dumps(
+                {
+                    "responseType": "answer",
+                    "modelResponse": "En España se vendieron 12.34.",
+                }
+            )
+        )
 
     monkeypatch.setenv("GEMINI_API_KEY", "test-key")
     monkeypatch.setenv("GEMINI_MODEL", "test-model")
@@ -518,6 +866,7 @@ def test_gemini_answer_generator_uses_question_and_sqlite_rows(monkeypatch):
         "¿Cuánto vendimos?",
         ["country", "total_sales"],
         [{"country": "España", "total_sales": 12.34}],
+        conversation_history,
     )
 
     assert answer == "En España se vendieron 12.34."
@@ -526,6 +875,7 @@ def test_gemini_answer_generator_uses_question_and_sqlite_rows(monkeypatch):
     assert request_options["model"] == "test-model"
     answer_context = json.loads(request_options["contents"])
     assert answer_context["question"] == "¿Cuánto vendimos?"
+    assert answer_context["conversation_history"] == conversation_history
     assert (
         datetime.fromisoformat(answer_context["current_datetime"]).utcoffset()
         is not None
@@ -533,6 +883,11 @@ def test_gemini_answer_generator_uses_question_and_sqlite_rows(monkeypatch):
     assert answer_context["columns"] == ["country", "total_sales"]
     assert answer_context["rows"] == [{"country": "España", "total_sales": 12.34}]
     assert request_options["config"].system_instruction == api.ANSWER_GENERATION_PROMPT
+    assert request_options["config"].response_mime_type == "application/json"
+    assert request_options["config"].response_schema is api.RespuestaJSON
+    assert "readable Markdown table" in (
+        request_options["config"].system_instruction
+    )
 
 
 def test_gemini_answer_generator_requires_api_key(monkeypatch):
@@ -548,7 +903,22 @@ def test_gemini_answer_generator_reports_empty_response(monkeypatch):
         monkeypatch, lambda **_: SimpleNamespace(text="   ")
     )
 
-    with pytest.raises(api.LLMQueryError, match="respuesta textual vacía"):
+    with pytest.raises(api.LLMQueryError, match="respuesta vacía"):
+        api.generate_answer_with_gemini("ventas", [], [])
+
+
+def test_gemini_answer_generator_rejects_sql_response_type(monkeypatch):
+    monkeypatch.setenv("GEMINI_API_KEY", "test-key")
+    _patch_gemini_client(
+        monkeypatch,
+        lambda **_: SimpleNamespace(
+            text=json.dumps(
+                {"responseType": "sql", "modelResponse": "SELECT 1"}
+            )
+        ),
+    )
+
+    with pytest.raises(api.LLMQueryError, match="respuesta en modelResponse"):
         api.generate_answer_with_gemini("ventas", [], [])
 
 
@@ -563,3 +933,92 @@ def test_gemini_answer_generator_reports_provider_errors(monkeypatch):
 
     with pytest.raises(api.LLMQueryError, match="respuesta textual"):
         api.generate_answer_with_gemini("ventas", [], [])
+
+
+def test_gemini_unavailable_answer_uses_explanation_prompt(monkeypatch):
+    request_options = {}
+    conversation_history = [
+        {"question": "ventas", "sql": None, "answer": "No hay datos visibles."}
+    ]
+
+    def generate_content(**kwargs):
+        request_options.update(kwargs)
+        return SimpleNamespace(
+            text=json.dumps(
+                {
+                    "responseType": "answer",
+                    "modelResponse": (
+                        "Solo puedo consultar las métricas de pedidos disponibles."
+                    ),
+                }
+            )
+        )
+
+    monkeypatch.setenv("GEMINI_API_KEY", "test-key")
+    monkeypatch.setenv("GEMINI_MODEL", "test-model")
+    clients = _patch_gemini_client(monkeypatch, generate_content)
+
+    answer = api.generate_unavailable_answer_with_gemini(
+        "Muéstrame los productos vendidos.",
+        "La información no está disponible en las vistas permitidas.",
+        conversation_history,
+    )
+
+    assert answer == "Solo puedo consultar las métricas de pedidos disponibles."
+    assert clients[0].closed is True
+    context = json.loads(request_options["contents"])
+    assert context["question"] == "Muéstrame los productos vendidos."
+    assert context["limitation"] == (
+        "La información no está disponible en las vistas permitidas."
+    )
+    assert context["conversation_history"] == conversation_history
+    assert request_options["config"].system_instruction == (
+        api.UNAVAILABLE_ANSWER_PROMPT
+    )
+    assert request_options["config"].response_mime_type == "application/json"
+    assert request_options["config"].response_schema is api.RespuestaJSON
+
+
+def test_gemini_unavailable_answer_requires_api_key(monkeypatch):
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+
+    with pytest.raises(api.LLMQueryError, match="GEMINI_API_KEY"):
+        api.generate_unavailable_answer_with_gemini("ventas", "sin acceso")
+
+
+def test_gemini_unavailable_answer_reports_empty_response(monkeypatch):
+    monkeypatch.setenv("GEMINI_API_KEY", "test-key")
+    _patch_gemini_client(
+        monkeypatch, lambda **_: SimpleNamespace(text="   ")
+    )
+
+    with pytest.raises(api.LLMQueryError, match="respuesta vacía"):
+        api.generate_unavailable_answer_with_gemini("ventas", "sin acceso")
+
+
+def test_gemini_unavailable_answer_rejects_sql_response_type(monkeypatch):
+    monkeypatch.setenv("GEMINI_API_KEY", "test-key")
+    _patch_gemini_client(
+        monkeypatch,
+        lambda **_: SimpleNamespace(
+            text=json.dumps(
+                {"responseType": "sql", "modelResponse": "SELECT 1"}
+            )
+        ),
+    )
+
+    with pytest.raises(api.LLMQueryError, match="explicación en modelResponse"):
+        api.generate_unavailable_answer_with_gemini("ventas", "sin acceso")
+
+
+def test_gemini_unavailable_answer_reports_provider_errors(monkeypatch):
+    monkeypatch.setenv("GEMINI_API_KEY", "test-key")
+    _patch_gemini_client(
+        monkeypatch,
+        lambda **_: (_ for _ in ()).throw(
+            api.errors.APIError(503, {"message": "simulated provider error"})
+        ),
+    )
+
+    with pytest.raises(api.LLMQueryError, match="explicar"):
+        api.generate_unavailable_answer_with_gemini("ventas", "sin acceso")

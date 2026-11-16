@@ -2,9 +2,14 @@ import json
 import logging
 import os
 import sqlite3
+import threading
+import time
+from collections import OrderedDict
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Literal
+from uuid import UUID, uuid4
 
 import httpx
 from dotenv import load_dotenv
@@ -12,7 +17,7 @@ from google import genai
 from google.genai import errors, types
 import sqlglot
 from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from sqlglot import exp
 from sqlglot.errors import ParseError
 
@@ -36,10 +41,15 @@ def _read_prompt(filename: str) -> str:
     return prompt
 
 
-SQL_GENERATION_PROMPT = _read_prompt("sql_generation.txt")
+DATABASE_SCHEMA_PROMPT = _read_prompt("database_schema.txt")
+SQL_GENERATION_PROMPT = (
+    f"{_read_prompt('sql_generation.txt')}\n\n{DATABASE_SCHEMA_PROMPT}"
+)
 ANSWER_GENERATION_PROMPT = _read_prompt("answer_generation.txt")
+UNAVAILABLE_ANSWER_PROMPT = _read_prompt("unavailable_answer.txt")
 
 ALLOWED_VIEWS = frozenset({"monthly_sales_by_country", "top_customers"})
+ALLOWED_QUERY_SOURCES = ALLOWED_VIEWS | {"orders"}
 ALLOWED_SQL_FUNCTIONS = frozenset(
     {
         "avg",
@@ -58,6 +68,9 @@ ALLOWED_SQL_FUNCTIONS = frozenset(
     }
 )
 MAX_RESULT_ROWS = 500
+CONVERSATION_TTL_SECONDS = 30 * 60
+MAX_CONVERSATIONS = 1000
+MAX_CONVERSATION_TURNS = 10
 
 
 class LLMQueryError(RuntimeError):
@@ -70,32 +83,131 @@ class QueryValidationError(ValueError):
 
 class AskRequest(BaseModel):
     question: str = Field(min_length=1, max_length=1000)
+    conversation_id: UUID | None = None
+
+
+class RespuestaJSON(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    responseType: Literal["sql", "answer"]
+    modelResponse: str = Field(min_length=1)
 
 
 class AskResponse(BaseModel):
+    conversation_id: UUID
     question: str
     answer: str
-    sql: str
+    sql: str | None
     columns: list[str]
     rows: list[dict[str, Any]]
     truncated: bool
 
 
-QueryGenerator = Callable[[str], str]
+@dataclass(frozen=True)
+class LLMDirectResponse:
+    text: str
+
+
+QueryGenerator = Callable[[str], str | LLMDirectResponse]
 AnswerGenerator = Callable[[str, list[str], list[dict[str, Any]]], str]
+ConversationTurn = dict[str, Any]
+ConversationHistory = list[ConversationTurn]
+UnavailableAnswerGenerator = Callable[[str, str, ConversationHistory], str]
+
+
+class ConversationCache:
+    def __init__(self) -> None:
+        self._conversations: OrderedDict[
+            str, tuple[float, ConversationHistory]
+        ] = OrderedDict()
+        self._lock = threading.Lock()
+
+    def _remove_expired(self, now: float) -> None:
+        expired = [
+            conversation_id
+            for conversation_id, (last_access, _) in self._conversations.items()
+            if now - last_access >= CONVERSATION_TTL_SECONDS
+        ]
+        for conversation_id in expired:
+            del self._conversations[conversation_id]
+
+    def get_history(self, conversation_id: str) -> ConversationHistory:
+        with self._lock:
+            now = time.monotonic()
+            self._remove_expired(now)
+            entry = self._conversations.get(conversation_id)
+            if entry is None:
+                return []
+            history = entry[1]
+            self._conversations[conversation_id] = (now, history)
+            self._conversations.move_to_end(conversation_id)
+            return [turn.copy() for turn in history]
+
+    def add_turn(self, conversation_id: str, turn: ConversationTurn) -> None:
+        with self._lock:
+            now = time.monotonic()
+            self._remove_expired(now)
+            entry = self._conversations.get(conversation_id)
+            history = entry[1] if entry is not None else []
+            history.append(turn.copy())
+            del history[:-MAX_CONVERSATION_TURNS]
+            self._conversations[conversation_id] = (now, history)
+            self._conversations.move_to_end(conversation_id)
+            while len(self._conversations) > MAX_CONVERSATIONS:
+                self._conversations.popitem(last=False)
+
+    def clear(self, conversation_id: str) -> bool:
+        with self._lock:
+            return self._conversations.pop(conversation_id, None) is not None
 
 
 def _current_datetime_context() -> str:
     return datetime.now().astimezone().isoformat(timespec="seconds")
 
 
-def generate_sql_with_gemini(question: str) -> str:
+def _gemini_json_config(
+    system_instruction: str, max_output_tokens: int = 256
+) -> types.GenerateContentConfig:
+    return types.GenerateContentConfig(
+        system_instruction=system_instruction,
+        response_mime_type="application/json",
+        response_schema=RespuestaJSON,
+        temperature=0,
+        max_output_tokens=max_output_tokens,
+    )
+
+
+def _parse_gemini_response(response_text: str | None) -> RespuestaJSON:
+    if not response_text or not response_text.strip():
+        raise LLMQueryError("Gemini devolvió una respuesta vacía.")
+    try:
+        payload = json.loads(response_text)
+    except json.JSONDecodeError as exc:
+        raise LLMQueryError("Gemini no devolvió un objeto JSON válido.") from exc
+    try:
+        result = RespuestaJSON.model_validate(payload)
+    except ValidationError as exc:
+        raise LLMQueryError(
+            "Gemini no devolvió el esquema JSON esperado con responseType y modelResponse."
+        ) from exc
+    if not result.modelResponse.strip():
+        raise LLMQueryError("Gemini devolvió un campo modelResponse vacío.")
+    return result
+
+
+def generate_sql_with_gemini(
+    question: str, conversation_history: ConversationHistory | None = None
+) -> str | LLMDirectResponse:
     api_key = os.getenv("GEMINI_API_KEY")
     if not api_key:
         raise LLMQueryError("Falta configurar GEMINI_API_KEY.")
 
     contents = json.dumps(
-        {"question": question, "current_datetime": _current_datetime_context()},
+        {
+            "question": question,
+            "current_datetime": _current_datetime_context(),
+            "conversation_history": conversation_history or [],
+        },
         ensure_ascii=False,
     )
     try:
@@ -103,30 +215,22 @@ def generate_sql_with_gemini(question: str) -> str:
             response = client.models.generate_content(
                 model=os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite"),
                 contents=contents,
-                config=types.GenerateContentConfig(
-                    system_instruction=SQL_GENERATION_PROMPT,
-                    response_mime_type="application/json",
-                    temperature=0,
-                    max_output_tokens=256,
-                ),
+                config=_gemini_json_config(SQL_GENERATION_PROMPT),
             )
     except (errors.APIError, httpx.RequestError) as exc:
         raise LLMQueryError("Gemini no pudo completar la solicitud.") from exc
 
-    response_text = (response.text or "").strip()
-    if not response_text:
-        raise LLMQueryError("Gemini devolvió una respuesta vacía.")
-    try:
-        payload = json.loads(response_text)
-    except json.JSONDecodeError as exc:
-        raise LLMQueryError("Gemini no devolvió un objeto JSON válido.") from exc
-    if not isinstance(payload, dict) or not isinstance(payload.get("sql"), str):
-        raise LLMQueryError("La respuesta de Gemini no contiene una consulta SQL.")
-    return payload["sql"].strip()
+    result = _parse_gemini_response(response.text)
+    if result.responseType == "sql":
+        return result.modelResponse.strip()
+    return LLMDirectResponse(result.modelResponse.strip())
 
 
 def generate_answer_with_gemini(
-    question: str, columns: list[str], rows: list[dict[str, Any]]
+    question: str,
+    columns: list[str],
+    rows: list[dict[str, Any]],
+    conversation_history: ConversationHistory | None = None,
 ) -> str:
     api_key = os.getenv("GEMINI_API_KEY")
     if not api_key:
@@ -138,6 +242,7 @@ def generate_answer_with_gemini(
             "current_datetime": _current_datetime_context(),
             "columns": columns,
             "rows": rows,
+            "conversation_history": conversation_history or [],
         },
         ensure_ascii=False,
     )
@@ -146,19 +251,51 @@ def generate_answer_with_gemini(
             response = client.models.generate_content(
                 model=os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite"),
                 contents=contents,
-                config=types.GenerateContentConfig(
-                    system_instruction=ANSWER_GENERATION_PROMPT,
-                    temperature=0,
-                    max_output_tokens=256,
-                ),
+                config=_gemini_json_config(ANSWER_GENERATION_PROMPT),
             )
     except (errors.APIError, httpx.RequestError) as exc:
         raise LLMQueryError("Gemini no pudo generar la respuesta textual.") from exc
 
-    answer = (response.text or "").strip()
-    if not answer:
-        raise LLMQueryError("Gemini devolvió una respuesta textual vacía.")
-    return answer
+    result = _parse_gemini_response(response.text)
+    if result.responseType != "answer":
+        raise LLMQueryError("Gemini no devolvió una respuesta en modelResponse.")
+    return result.modelResponse.strip()
+
+
+def generate_unavailable_answer_with_gemini(
+    question: str,
+    limitation: str,
+    conversation_history: ConversationHistory | None = None,
+) -> str:
+    api_key = os.getenv("GEMINI_API_KEY")
+    if not api_key:
+        raise LLMQueryError("Falta configurar GEMINI_API_KEY.")
+
+    contents = json.dumps(
+        {
+            "question": question,
+            "current_datetime": _current_datetime_context(),
+            "conversation_history": conversation_history or [],
+            "limitation": limitation,
+        },
+        ensure_ascii=False,
+    )
+    try:
+        with genai.Client(api_key=api_key) as client:
+            response = client.models.generate_content(
+                model=os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite"),
+                contents=contents,
+                config=_gemini_json_config(UNAVAILABLE_ANSWER_PROMPT),
+            )
+    except (errors.APIError, httpx.RequestError) as exc:
+        raise LLMQueryError(
+            "Gemini no pudo explicar por qué no fue posible consultar esos datos."
+        ) from exc
+
+    result = _parse_gemini_response(response.text)
+    if result.responseType != "answer":
+        raise LLMQueryError("Gemini no devolvió una explicación en modelResponse.")
+    return result.modelResponse.strip()
 
 
 def validate_read_query(sql: str) -> str:
@@ -184,10 +321,10 @@ def validate_read_query(sql: str) -> str:
         if (
             table.catalog
             or table.db
-            or table.name.lower() not in ALLOWED_VIEWS
+            or table.name.lower() not in ALLOWED_QUERY_SOURCES
         ):
             raise QueryValidationError(
-                "Solo se permite consultar monthly_sales_by_country y top_customers."
+                "The query references a database object that is not allowed."
             )
 
     return statement.sql(dialect="sqlite")
@@ -201,7 +338,9 @@ def _read_only_authorizer(action, argument_one, argument_two, database, source):
         view_source = (source or "").lower()
         if table_name in ALLOWED_VIEWS:
             return sqlite3.SQLITE_OK
-        if table_name == "orders" and view_source in ALLOWED_VIEWS:
+        if table_name == "orders" and (
+            not view_source or view_source in ALLOWED_VIEWS
+        ):
             return sqlite3.SQLITE_OK
         return sqlite3.SQLITE_DENY
     if action == sqlite3.SQLITE_FUNCTION:
@@ -237,36 +376,110 @@ def create_app(
     db_path: Path = DEFAULT_DB_PATH,
     query_generator: QueryGenerator | None = None,
     answer_generator: AnswerGenerator | None = None,
+    unavailable_answer_generator: UnavailableAnswerGenerator | None = None,
 ) -> FastAPI:
     app = FastAPI(title="Orders Analytics API", version="1.0.0")
-    generate_query = (
-        query_generator if query_generator is not None else generate_sql_with_gemini
-    )
-    generate_answer = (
-        answer_generator
-        if answer_generator is not None
-        else generate_answer_with_gemini
-    )
+    conversation_cache = ConversationCache()
+
+    def generate_query(
+        question: str, history: ConversationHistory
+    ) -> str | LLMDirectResponse:
+        if query_generator is None:
+            return generate_sql_with_gemini(question, history)
+        return query_generator(question)
+
+    def generate_answer(
+        question: str,
+        columns: list[str],
+        rows: list[dict[str, Any]],
+        history: ConversationHistory,
+    ) -> str:
+        if answer_generator is None:
+            return generate_answer_with_gemini(question, columns, rows, history)
+        return answer_generator(question, columns, rows)
+
+    def generate_unavailable_answer(
+        question: str, history: ConversationHistory
+    ) -> str:
+        limitation = (
+            "La solicitud no se pudo responder con una consulta segura sobre los "
+            "datos de pedidos disponibles."
+        )
+        if unavailable_answer_generator is None:
+            return generate_unavailable_answer_with_gemini(
+                question, limitation, history
+            )
+        return unavailable_answer_generator(question, limitation, history)
+
+    def response_without_query(
+        question: str, conversation_id: UUID, history: ConversationHistory
+    ) -> AskResponse:
+        try:
+            answer = generate_unavailable_answer(question, history)
+        except LLMQueryError as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+        conversation_cache.add_turn(
+            str(conversation_id),
+            {"question": question, "sql": None, "answer": answer},
+        )
+        return AskResponse(
+            conversation_id=conversation_id,
+            question=question,
+            answer=answer,
+            sql=None,
+            columns=[],
+            rows=[],
+            truncated=False,
+        )
+
+    @app.delete("/conversations/{conversation_id}")
+    def clear_conversation(conversation_id: UUID) -> dict[str, Any]:
+        if not conversation_cache.clear(str(conversation_id)):
+            raise HTTPException(
+                status_code=404, detail="No hay contexto activo para esa conversación."
+            )
+        return {"conversation_id": conversation_id, "cleared": True}
 
     @app.post("/ask", response_model=AskResponse)
     def ask(request: AskRequest) -> AskResponse:
         question = request.question.strip()
         if not question:
             raise HTTPException(status_code=422, detail="La pregunta no puede estar vacía.")
+        conversation_id = request.conversation_id or uuid4()
+        conversation_key = str(conversation_id)
+        history = conversation_cache.get_history(conversation_key)
 
         try:
-            generated_sql = generate_query(question)
+            generated_result = generate_query(question, history)
         except LLMQueryError as exc:
             raise HTTPException(status_code=502, detail=str(exc)) from exc
-        LOGGER.info("SQL generado para la pregunta: %r", generated_sql)
+        if isinstance(generated_result, LLMDirectResponse):
+            conversation_cache.add_turn(
+                conversation_key,
+                {
+                    "question": question,
+                    "sql": None,
+                    "answer": generated_result.text,
+                },
+            )
+            return AskResponse(
+                conversation_id=conversation_id,
+                question=question,
+                answer=generated_result.text,
+                sql=None,
+                columns=[],
+                rows=[],
+                truncated=False,
+            )
+        LOGGER.info("SQL generado para la pregunta: %r", generated_result)
 
         try:
-            safe_sql = validate_read_query(generated_sql)
-        except QueryValidationError as exc:
-            raise HTTPException(
-                status_code=502,
-                detail=f"El modelo devolvió una consulta no permitida: {exc}",
-            ) from exc
+            safe_sql = validate_read_query(generated_result)
+        except QueryValidationError:
+            LOGGER.warning(
+                "Gemini generó una consulta que no coincide con el esquema permitido."
+            )
+            return response_without_query(question, conversation_id, history)
 
         LOGGER.info(
             "Ejecutando SQL validado en SQLite (%s): %r",
@@ -298,17 +511,24 @@ def create_app(
                         "la tabla orders desde el CSV."
                     ),
                 ) from exc
+            if "not authorized" in str(exc).lower():
+                return response_without_query(question, conversation_id, history)
             raise HTTPException(
                 status_code=502,
                 detail="La consulta generada no se pudo ejecutar en SQLite.",
             ) from exc
 
         try:
-            answer = generate_answer(question, columns, rows)
+            answer = generate_answer(question, columns, rows, history)
         except LLMQueryError as exc:
             raise HTTPException(status_code=502, detail=str(exc)) from exc
 
+        conversation_cache.add_turn(
+            conversation_key,
+            {"question": question, "sql": safe_sql, "answer": answer},
+        )
         return AskResponse(
+            conversation_id=conversation_id,
             question=question,
             answer=answer,
             sql=safe_sql,

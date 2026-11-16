@@ -45,9 +45,12 @@ Esta ejecución realiza llamadas reales a Gemini; puede consumir cuota de la API
 
 ## API FastAPI
 
-La carga de pedidos crea las vistas `monthly_sales_by_country` y
-`top_customers`. Las ventas y el gasto de clientes cuentan únicamente pedidos
-`paid` o `shipped`; las vistas exponen importes en unidades monetarias.
+La base incluye la tabla `orders` y las vistas `monthly_sales_by_country` y
+`top_customers`. Se permiten consultas `SELECT` de solo lectura sobre esos tres
+orígenes. Las vistas de ventas y clientes cuentan únicamente pedidos `paid` o
+`shipped`; la tabla contiene pedidos individuales y guarda `amount_cents` en
+centavos enteros. La tabla administrativa que aparece en el esquema está
+explícitamente bloqueada.
 
 ```powershell
 python -m pip install -r requirements.txt
@@ -64,19 +67,49 @@ Envía una pregunta a `POST /ask`:
 {"question": "¿Cuánto vendimos en España en marzo de 2025?"}
 ```
 
-La respuesta incluye `answer`, un resumen textual redactado por Gemini usando
-solo las filas que devolvió SQLite, además del SQL, las columnas, las filas y si
-el resultado fue truncado. Antes de ejecutarlo, exige una única consulta `SELECT`
-sobre las dos vistas permitidas; además, abre SQLite en modo de solo lectura y
-limita la respuesta a 500 filas. Configura `GEMINI_MODEL` para elegir otro modelo.
+La respuesta devuelve un `conversation_id`. Envíalo en las siguientes
+solicitudes para conservar el contexto de esa conversación:
+
+```json
+{
+  "question": "¿Y en abril?",
+  "conversation_id": "UUID-devuelto-por-la-primera-respuesta"
+}
+```
+
+Para borrar el contexto de una conversación, llama a
+`DELETE /conversations/{conversation_id}`. El contexto vive en memoria: expira
+tras 30 minutos de inactividad, conserva hasta 10 turnos por conversación, limita
+la caché a 1.000 conversaciones y se pierde al reiniciar la aplicación. No se
+comparte entre varios procesos de Uvicorn. Mantén privado el `conversation_id`;
+no hay autenticación en esta API.
+
+Si la pregunta se puede responder con los datos, Gemini genera una consulta que
+se valida antes de ejecutarla. Si queda fuera del análisis de pedidos o pide
+información que no está en las vistas, Gemini responde directamente sin SQL.
+Si una consulta generada no es segura o no se ajusta al esquema, no se ejecuta y
+Gemini explica la limitación en lenguaje natural. Cuando no hay filas, la
+respuesta también lo indica sin inventar resultados. En respuestas directas,
+`sql` es `null` y `columns` y `rows` están vacíos.
+
+La respuesta incluye `answer`, redactada por Gemini usando el resultado de
+SQLite y el contexto reciente, además del SQL (si aplica), las columnas, las
+filas y si el resultado fue truncado. Cuando hay filas, Gemini las presenta en
+una tabla Markdown legible. La API solo permite una consulta `SELECT` sobre los
+orígenes autorizados; abre SQLite en modo de solo lectura y limita la respuesta
+a 500 filas. Configura `GEMINI_MODEL` para elegir otro modelo.
 `.env` está excluido de Git; las pruebas simulan Gemini y no requieren una clave
 real. Si Gemini no puede redactar la respuesta, la API devuelve un error claro.
 
-Las instrucciones de los dos pasos del modelo están en
-`prompts/sql_generation.txt` y `prompts/answer_generation.txt`, no embebidas en
-Python. Cada petición a Gemini recibe también la fecha y hora local actual en
-ISO 8601 con zona horaria; el prompt SQL la usa para resolver expresiones como
-"este mes" y generar sintaxis SQLite.
+Las instrucciones del modelo están en
+`prompts/sql_generation.txt`, `prompts/answer_generation.txt` y
+`prompts/unavailable_answer.txt`. El esquema convertido de JSON a texto está en
+`prompts/database_schema.txt` y se añade al prompt SQL al iniciar la API. Los
+prompts y las propiedades estructuradas enviadas al modelo usan inglés; las
+respuestas al usuario se mantienen en español salvo que pida otro idioma. Todas
+las llamadas a Gemini solicitan JSON estructurado mediante `response_schema`;
+la salida lleva el tipo en `responseType` y el SQL o mensaje en `modelResponse`.
+Cada petición recibe la fecha y hora local actual en ISO 8601 con zona horaria.
 
 El SQL generado y el SQL validado (junto con la ruta de SQLite) aparecen en los
 logs de Uvicorn. Si la API indica que faltan las vistas analíticas, detén el

@@ -29,6 +29,7 @@ Remove-Item Env:RUN_GEMINI_INTEGRATION (Nota puede llegar a fallar por los limit
 - Se implementarian semaforos para limitar las consultar al mismo tiempo y evitar saturar el sistema 
 - Impleria cache con Redis para las preguntas mas frecuentes
 - Anadira mas documentacion para mayor contexto respecto a logica de negocio
+- Se dejo en la respuesta del endpoint la consulta SQL realiza por la IA y otros datos para mejor observabilidad en esta prueba no recomendado para versiones reales
 
 
 ## Datos de pedidos y SQLite
@@ -186,4 +187,5 @@ válidos e inválidos. Se aceptaron la semilla fija, los importes en centavos,
 la lista cerrada de vistas permitidas y el uso de un LLM simulado en tests.
 Se corrigieron expectativas de pruebas para datasets pequeños y se endureció
 la validación después de comprobar que un parser SQL podía aceptar un `SELECT`
-sin columnas. No se incluyó ninguna clave en el código ni en Git.
+sin columnas. Se corrigio, formato de promp estructura cambiando el idioma, 
+si se tomo base principal del promp y estructura base de los servicios

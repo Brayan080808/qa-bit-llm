@@ -138,6 +138,22 @@ def load_orders(csv_path: Path = DEFAULT_CSV_PATH, db_path: Path = DEFAULT_DB_PA
     return stats
 
 
+def clear_orders(db_path: Path = DEFAULT_DB_PATH) -> int:
+    if not db_path.is_file():
+        raise FileNotFoundError(db_path)
+
+    connection = sqlite3.connect(db_path)
+    try:
+        with connection:
+            row_count = connection.execute(
+                "SELECT COUNT(*) FROM orders"
+            ).fetchone()[0]
+            connection.execute("DELETE FROM orders")
+        return row_count
+    finally:
+        connection.close()
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Limpia el CSV de pedidos y reemplaza la tabla orders en SQLite."

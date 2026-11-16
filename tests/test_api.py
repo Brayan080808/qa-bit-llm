@@ -2,6 +2,7 @@ import csv
 import json
 import logging
 import sqlite3
+from io import StringIO
 from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -83,6 +84,41 @@ def _delete_conversation(app, conversation_id):
             return await client.delete(f"/conversations/{conversation_id}")
 
     return anyio.run(send_request)
+
+
+def _upload_csv(app, filename, content):
+    async def send_request():
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app),
+            base_url="http://test",
+        ) as client:
+            return await client.post(
+                "/orders/upload",
+                files={"file": (filename, content, "text/csv")},
+            )
+
+    return anyio.run(send_request)
+
+
+def _delete_orders(app, confirm):
+    async def send_request():
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app),
+            base_url="http://test",
+        ) as client:
+            return await client.request(
+                "DELETE", "/orders", json={"confirm": confirm}
+            )
+
+    return anyio.run(send_request)
+
+
+def _csv_bytes(orders):
+    buffer = StringIO(newline="")
+    writer = csv.DictWriter(buffer, fieldnames=clean_orders.FIELDNAMES)
+    writer.writeheader()
+    writer.writerows(orders)
+    return buffer.getvalue().encode("utf-8")
 
 
 class _FakeGeminiClient:
@@ -494,6 +530,113 @@ def test_endpoint_returns_422_for_blank_question_without_calling_llm(tmp_path):
 
     assert response.status_code == 422
     assert calls == []
+
+
+def test_upload_endpoint_cleans_and_replaces_database_from_csv(tmp_path):
+    _, db_path = _client_for_orders(tmp_path, [_order()], lambda _: "")
+    app = api.create_app(db_path)
+    valid_order = _order(customer="Cliente Chile", country="Chile", amount="20.50")
+    invalid_date = _order(order_date="16/11/2026", country="Chile")
+    missing_amount = _order(amount="", country="Chile")
+    csv_content = _csv_bytes(
+        [valid_order, valid_order.copy(), invalid_date, missing_amount]
+    )
+
+    response = _upload_csv(app, "orders.csv", csv_content)
+
+    assert response.status_code == 200
+    assert response.json()["stats"] == {
+        "read": 4,
+        "duplicates": 1,
+        "invalid_dates": 1,
+        "missing_amounts": 1,
+        "invalid_amounts": 0,
+        "loaded": 1,
+    }
+    assert response.json()["filename"] == "orders.csv"
+    with sqlite3.connect(db_path) as connection:
+        assert connection.execute(
+            "SELECT customer, country, amount_cents FROM orders"
+        ).fetchall() == [("Cliente Chile", "Chile", 2050)]
+
+
+def test_upload_endpoint_rejects_bad_csv_without_changing_database(tmp_path):
+    app, db_path = _client_for_orders(tmp_path, [_order()], lambda _: "")
+    invalid_csv = b"date,customer\n2025-03-01,Cliente"
+
+    response = _upload_csv(app, "bad.csv", invalid_csv)
+
+    assert response.status_code == 422
+    with sqlite3.connect(db_path) as connection:
+        assert connection.execute("SELECT COUNT(*) FROM orders").fetchone()[0] == 1
+
+
+def test_upload_endpoint_rejects_non_csv_file(tmp_path):
+    app, _ = _client_for_orders(tmp_path, [_order()], lambda _: "")
+
+    response = _upload_csv(app, "orders.txt", b"not a CSV")
+
+    assert response.status_code == 415
+
+
+def test_upload_endpoint_rejects_files_over_size_limit(tmp_path):
+    app, _ = _client_for_orders(tmp_path, [_order()], lambda _: "")
+
+    response = _upload_csv(
+        app,
+        "large.csv",
+        b"x" * (api.MAX_CSV_UPLOAD_BYTES + 1),
+    )
+
+    assert response.status_code == 413
+
+
+def test_clear_orders_endpoint_requires_explicit_confirmation(tmp_path):
+    app, db_path = _client_for_orders(tmp_path, [_order()], lambda _: "")
+
+    response = _delete_orders(app, confirm=False)
+
+    assert response.status_code == 400
+    with sqlite3.connect(db_path) as connection:
+        assert connection.execute("SELECT COUNT(*) FROM orders").fetchone()[0] == 1
+
+
+def test_clear_orders_endpoint_deletes_rows_and_keeps_analytic_views(tmp_path):
+    orders = [_order(), _order(customer="Cliente 002", amount="20.00")]
+    app, db_path = _client_for_orders(tmp_path, orders, lambda _: "")
+
+    response = _delete_orders(app, confirm=True)
+
+    assert response.status_code == 200
+    assert response.json() == {"deleted_count": 2, "cleared": True}
+    with sqlite3.connect(db_path) as connection:
+        assert connection.execute("SELECT COUNT(*) FROM orders").fetchone()[0] == 0
+        assert connection.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'view' "
+            "AND name IN ('monthly_sales_by_country', 'top_customers') "
+            "ORDER BY name"
+        ).fetchall() == [
+            ("monthly_sales_by_country",),
+            ("top_customers",),
+        ]
+
+
+def test_clear_orders_endpoint_reports_missing_database(tmp_path):
+    app = api.create_app(tmp_path / "missing.sqlite")
+
+    response = _delete_orders(app, confirm=True)
+
+    assert response.status_code == 503
+
+
+def test_clear_orders_endpoint_reports_uninitialized_database(tmp_path):
+    db_path = tmp_path / "empty.sqlite"
+    sqlite3.connect(db_path).close()
+    app = api.create_app(db_path)
+
+    response = _delete_orders(app, confirm=True)
+
+    assert response.status_code == 503
 
 
 def test_endpoint_returns_service_unavailable_when_database_is_missing(tmp_path):

@@ -42,6 +42,17 @@ Remove-Item Env:RUN_GEMINI_INTEGRATION
 ```
 
 Esta ejecución realiza llamadas reales a Gemini; puede consumir cuota de la API.
+También se incluyen 20 casos de integración (consultas válidas y solicitudes no
+permitidas). Para ejecutar solo esos casos y mostrar cada salida JSON:
+
+```powershell
+$env:RUN_GEMINI_INTEGRATION = "1"
+python -m pytest -s tests/test_gemini_database.py -k live_gemini_prompt
+Remove-Item Env:RUN_GEMINI_INTEGRATION
+```
+
+Cada uno de estos 20 casos realiza una llamada real a Gemini y puede consumir
+cuota de la API.
 
 ## API FastAPI
 
@@ -54,12 +65,31 @@ explícitamente bloqueada.
 
 ```powershell
 python -m pip install -r requirements.txt
-python generate_orders.py
-python clean_orders.py
 Copy-Item .env.example .env
 # Edita .env y define GEMINI_API_KEY con tu clave, sin compartirla ni subirla.
+python setup_project.py
 uvicorn api:app --reload
 ```
+
+`setup_project.py` pregunta si deseas generar un CSV de ejemplo o cargar uno
+propio. La estructura requerida, en este orden, es:
+
+```text
+order_date,customer,country,product,amount,status
+2025-03-01,Customer 001,Chile,Laptop,12.34,paid
+```
+
+La carga limpia duplicados, fechas inválidas e importes vacíos o inválidos y
+reemplaza los pedidos de SQLite en una transacción.
+
+También puedes cargar el CSV desde `POST /orders/upload` como `multipart/form-data`
+con un campo `file`; la API devuelve el resumen de filas leídas, descartadas y
+cargadas. El endpoint rechaza CSV con una estructura incorrecta y archivos
+mayores a 10 MB.
+
+Para vaciar la tabla desde `DELETE /orders`, envía explícitamente
+`{"confirm": true}`. El endpoint solo borra pedidos; conserva la base y las
+vistas analíticas.
 
 Envía una pregunta a `POST /ask`:
 

@@ -49,6 +49,10 @@ allowlist and read-only access.
   `amount_cents / 100.0 AS price`; do not label raw cents as a currency amount.
 - For completed sales, use `status IN ('paid', 'shipped')`, unless the user
   explicitly asks for a different status.
+- If the user asks for one specific status (for example, only `paid`, `pending`,
+  or `cancelled`), query `orders` and filter `status` explicitly. The
+  `monthly_sales_by_country` and `top_customers` views combine paid and shipped
+  orders and cannot answer a question about a single status.
 - For a month, compare `month` with a `YYYY-MM` literal. For a year, use
   `month LIKE 'YYYY-%'`. Resolve relative dates from `current_datetime`, never
   from SQLite's `'now'`.
@@ -72,6 +76,9 @@ Paid and shipped sales for Spain in March 2025:
 
 Order count by status for Chile, when the user asks about status:
 `{"responseType":"sql","modelResponse":"SELECT status, COUNT(*) AS order_count FROM orders WHERE country = 'Chile' GROUP BY status ORDER BY order_count DESC LIMIT 20"}`
+
+Only paid orders in Chile:
+`{"responseType":"sql","modelResponse":"SELECT COUNT(*) AS order_count FROM orders WHERE country = 'Chile' AND status = 'paid'"}`
 
 Current month's order count using the illustrative context
 `2026-11-16T10:30:00-05:00`:

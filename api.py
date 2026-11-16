@@ -2,6 +2,7 @@ import json
 import logging
 import os
 import sqlite3
+import tempfile
 import threading
 import time
 from collections import OrderedDict
@@ -16,11 +17,12 @@ from dotenv import load_dotenv
 from google import genai
 from google.genai import errors, types
 import sqlglot
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from fastapi import FastAPI, File, HTTPException, UploadFile
+from pydantic import BaseModel, Field, ValidationError
 from sqlglot import exp
 from sqlglot.errors import ParseError
 
+import clean_orders
 from clean_orders import DEFAULT_DB_PATH
 
 
@@ -68,6 +70,7 @@ ALLOWED_SQL_FUNCTIONS = frozenset(
     }
 )
 MAX_RESULT_ROWS = 500
+MAX_CSV_UPLOAD_BYTES = 10 * 1024 * 1024
 CONVERSATION_TTL_SECONDS = 30 * 60
 MAX_CONVERSATIONS = 1000
 MAX_CONVERSATION_TURNS = 10
@@ -86,11 +89,13 @@ class AskRequest(BaseModel):
     conversation_id: UUID | None = None
 
 
-class RespuestaJSON(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+class ClearOrdersRequest(BaseModel):
+    confirm: bool = False
 
+
+class RespuestaJSON(BaseModel):
     responseType: Literal["sql", "answer"]
-    modelResponse: str = Field(min_length=1)
+    modelResponse: str
 
 
 class AskResponse(BaseModel):
@@ -101,6 +106,17 @@ class AskResponse(BaseModel):
     columns: list[str]
     rows: list[dict[str, Any]]
     truncated: bool
+
+
+class OrderUploadResponse(BaseModel):
+    filename: str
+    stats: dict[str, int]
+    message: str
+
+
+class ClearOrdersResponse(BaseModel):
+    deleted_count: int
+    cleared: bool
 
 
 @dataclass(frozen=True)
@@ -184,6 +200,13 @@ def _parse_gemini_response(response_text: str | None) -> RespuestaJSON:
         payload = json.loads(response_text)
     except json.JSONDecodeError as exc:
         raise LLMQueryError("Gemini no devolvió un objeto JSON válido.") from exc
+    if not isinstance(payload, dict) or set(payload) != {
+        "responseType",
+        "modelResponse",
+    }:
+        raise LLMQueryError(
+            "Gemini no devolvió el esquema JSON esperado con responseType y modelResponse."
+        )
     try:
         result = RespuestaJSON.model_validate(payload)
     except ValidationError as exc:
@@ -380,6 +403,77 @@ def create_app(
 ) -> FastAPI:
     app = FastAPI(title="Orders Analytics API", version="1.0.0")
     conversation_cache = ConversationCache()
+
+    @app.post("/orders/upload", response_model=OrderUploadResponse)
+    async def upload_orders(file: UploadFile = File(...)) -> OrderUploadResponse:
+        filename = file.filename or ""
+        if Path(filename).suffix.lower() != ".csv":
+            await file.close()
+            raise HTTPException(status_code=415, detail="Debes subir un archivo .csv.")
+
+        try:
+            contents = await file.read(MAX_CSV_UPLOAD_BYTES + 1)
+        finally:
+            await file.close()
+        if len(contents) > MAX_CSV_UPLOAD_BYTES:
+            raise HTTPException(
+                status_code=413,
+                detail="El archivo CSV supera el límite de 10 MB.",
+            )
+
+        temporary_path: Path | None = None
+        try:
+            with tempfile.NamedTemporaryFile(suffix=".csv", delete=False) as temp_file:
+                temp_file.write(contents)
+                temporary_path = Path(temp_file.name)
+            stats = clean_orders.load_orders(temporary_path, db_path)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        except sqlite3.Error as exc:
+            LOGGER.exception("No se pudo cargar el archivo CSV en SQLite.")
+            raise HTTPException(
+                status_code=500, detail="No se pudo cargar el CSV en la base de datos."
+            ) from exc
+        finally:
+            if temporary_path is not None:
+                temporary_path.unlink(missing_ok=True)
+
+        return OrderUploadResponse(
+            filename=Path(filename).name,
+            stats=stats,
+            message="CSV validado, limpiado y cargado correctamente.",
+        )
+
+    @app.delete("/orders", response_model=ClearOrdersResponse)
+    def delete_orders(request: ClearOrdersRequest) -> ClearOrdersResponse:
+        if not request.confirm:
+            raise HTTPException(
+                status_code=400,
+                detail="Confirma la eliminación enviando {\"confirm\": true}.",
+            )
+        try:
+            deleted_count = clean_orders.clear_orders(db_path)
+        except FileNotFoundError as exc:
+            raise HTTPException(
+                status_code=503,
+                detail="La base de datos no existe. Sube primero un CSV.",
+            ) from exc
+        except sqlite3.OperationalError as exc:
+            LOGGER.exception("No se pudieron vaciar los pedidos de SQLite.")
+            if "no such table: orders" in str(exc).lower():
+                raise HTTPException(
+                    status_code=503,
+                    detail="La base de datos todavía no contiene la tabla de pedidos.",
+                ) from exc
+            raise HTTPException(
+                status_code=500, detail="No se pudieron vaciar los pedidos."
+            ) from exc
+        except sqlite3.Error as exc:
+            LOGGER.exception("No se pudieron vaciar los pedidos de SQLite.")
+            raise HTTPException(
+                status_code=500, detail="No se pudieron vaciar los pedidos."
+            ) from exc
+        return ClearOrdersResponse(deleted_count=deleted_count, cleared=True)
 
     def generate_query(
         question: str, history: ConversationHistory

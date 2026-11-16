@@ -1,5 +1,7 @@
 # qa-bit-llm
 
+## Usar la rama MASTER del proyecto
+
 ## Instalacion resumen
 - python generate_orders.py
 - python clean_orders.py --csv data/orders.csv --db data/orders.sqlite
